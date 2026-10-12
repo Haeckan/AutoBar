@@ -492,7 +492,7 @@ def load_muffin_data(p_xpac):
 	# The AutoBar/miner.py xpac slug doesn't always match the WoWData repo's item-pickle
 	# slug -- e.g. "camelot" here is "forever" over there.
 	muffin_xpac = XPAC_TO_MUFFIN_DATA_NAME.get(p_xpac, p_xpac)
-	file_name = f"D:/Projects/Current/WoW/WoWData/ItemData/items_{muffin_xpac}.pkl"
+	file_name = f"items_{muffin_xpac}.pkl"
 	if os.path.isfile(file_name):
 		with open(file_name,"rb") as f:
 			g_muffin_data = pickle.load(f)
