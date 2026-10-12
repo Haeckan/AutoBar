@@ -51,6 +51,12 @@ LIST_PAGES = [
     "items/trade-goods",
 ]
 
+# Lueckenlose Abdeckung: zusaetzlich JEDE Unterklasse per Nummer abfragen
+# (Wowhead-Format  items=<klasse>.<unterklasse>). Leere Unterklassen werden still
+# uebersprungen. So faellt nichts durch, was in keine der Namens-Seiten oben passt.
+#   Klasse 0 = Consumable, 7 = Trade Goods, 12 = Quest, 15 = Miscellaneous
+SUBCLASS_SWEEP = {0: range(0, 16), 7: range(0, 20), 12: range(0, 3), 15: range(0, 16)}
+
 # Wo der Tooltip pro Item geholt wird. {id} wird ersetzt.
 # ACHTUNG: Diese URL ist eine Annahme (bei Classic funktioniert das Muster
 # nether.wowhead.com/classic/tooltip/item/<id>). Mit  --probe 2070  pruefen!
@@ -68,18 +74,30 @@ TIMEOUT = 60
 
 
 # ---------------------------------------------------------------- Hilfsfunktionen
+class Throttled(RuntimeError):
+    """Wowhead bremst/blockiert (z.B. HTTP 202 = Bot-Schutzseite, 429, 403)."""
+
+
+THROTTLE_CODES = (202, 403, 429, 503)
+CACHE_MAX_AGE = 12 * 3600  # Listenseiten-Cache: 12 Stunden
+
+
 def get(url, retries=3, delay=2.0):
-    """HTTP-GET mit ein paar Wiederholungen."""
-    last = None
+    """HTTP-GET mit Wiederholungen. Bei Drosselung lange warten, dann Throttled."""
+    last, throttled = None, False
     for attempt in range(retries):
+        throttled = False
         try:
             r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
             if r.status_code == 200:
                 return r
             last = f"HTTP {r.status_code}"
+            throttled = r.status_code in THROTTLE_CODES
         except requests.RequestException as exc:
             last = str(exc)
-        time.sleep(delay * (attempt + 1))
+        time.sleep((30 if throttled else delay) * (attempt + 1))
+    if throttled:
+        raise Throttled(f"{url}: {last}")
     raise RuntimeError(f"{url}: {last}")
 
 
@@ -129,6 +147,8 @@ def main():
     ap = argparse.ArgumentParser(description="items_forever.pkl aus Wowhead Forever erzeugen")
     ap.add_argument("--out", default="items_forever.pkl", help="Zieldatei (Standard: ./items_forever.pkl)")
     ap.add_argument("--delay", type=float, default=0.6, help="Pause zwischen Anfragen in Sekunden (Standard 0.6)")
+    ap.add_argument("--page-delay", type=float, default=2.0, help="Pause zwischen Listenseiten in Sekunden (Standard 2.0)")
+    ap.add_argument("--no-cache", action="store_true", help="Listenseiten-Cache ignorieren")
     ap.add_argument("--refresh", action="store_true", help="alle Tooltips neu laden, nicht nur neue Items")
     ap.add_argument("--probe", type=int, metavar="ITEM_ID", help="nur einen Tooltip testen und beenden")
     ap.add_argument("--tooltip-url", default=TOOLTIP_URL, help="URL-Muster fuer Tooltips, {id} als Platzhalter")
@@ -147,21 +167,65 @@ def main():
 
     # 1) Item-Listen einsammeln
     found = {}  # id -> (name, item_type)
-    for page in LIST_PAGES:
+    page_sets = {}  # Seite -> Menge der Item-IDs (fuer den Abdeckungs-Check)
+    sweep_pages = [f"items={c}.{sc}" for c, subs in SUBCLASS_SWEEP.items() for sc in subs]
+    cache_path = Path("listpages_cache_forever.json")
+    try:
+        cache = json.loads(cache_path.read_text()) if cache_path.is_file() and not args.no_cache else {}
+    except ValueError:
+        cache = {}
+    now = time.time()
+    for page in LIST_PAGES + sweep_pages:
+        is_sweep = page in sweep_pages
         url = WOWHEAD_ROOT + page
-        try:
-            lv = parse_listview(get(url).text)
-        except RuntimeError as exc:
-            print(f"  !! uebersprungen: {exc}")
-            continue
+        entry = cache.get(page)
+        if entry and now - entry["t"] < CACHE_MAX_AGE:
+            lv = entry["items"]  # frisch aus dem Cache, keine Anfrage noetig
+        else:
+            try:
+                lv = parse_listview(get(url).text)
+            except Throttled as exc:
+                sys.exit(f"\n!! Wowhead bremst/blockiert ({exc}).\n"
+                         "   Abbruch ohne Aenderungen. Bereits geladene Seiten sind im Cache -\n"
+                         "   in 1-2 Stunden einfach erneut starten, es geht dort weiter.")
+            except RuntimeError as exc:
+                if not is_sweep:
+                    print(f"  !! uebersprungen: {exc}")
+                continue
+            if lv is not None:
+                lv = [{"id": int(i["id"]), "name": i.get("name", ""), "classs": i.get("classs")} for i in lv]
+            cache[page] = {"t": now, "items": lv}
+            cache_path.write_text(json.dumps(cache))
+            time.sleep(args.page_delay)
         if lv is None:
-            print(f"  !! keine Item-Liste gefunden: {url} (Slug falsch oder Wowhead hat die Seite geaendert)")
+            if not is_sweep:  # leere Unterklassen im Sweep sind normal
+                print(f"  !! keine Item-Liste gefunden: {url} (Slug falsch oder Wowhead hat die Seite geaendert)")
             continue
-        flag = "  <-- 1000er-Limit erreicht, Liste evtl. unvollstaendig!" if len(lv) >= 1000 else ""
+        capped = len(lv) >= 1000
+        flag = "  <-- 1000er-Limit erreicht, Liste evtl. unvollstaendig!" if capped else ""
         print(f"  {page}: {len(lv)} Items{flag}")
+        page_sets[page] = {int(it["id"]) for it in lv}
         for it in lv:
             found[int(it["id"])] = (it.get("name", ""), ITEM_CLASS.get(it.get("classs"), "Other"))
-        time.sleep(args.delay)
+
+    if not any(pg in page_sets for pg in sweep_pages):
+        print("\n  !! WARNUNG: KEINE einzige Unterklassen-Seite (items=K.U) lieferte Items.")
+        print("     Vermutlich funktioniert dieses URL-Format bei Wowhead Forever nicht -> Sweep wirkungslos!")
+
+    # Abdeckungs-Check: Was steht NUR auf einer gedeckelten Seite und auf keiner anderen?
+    # (Dann wuerde es ohne die uebrigen Seiten fehlen - und evtl. fehlt noch mehr dahinter.)
+    print("\nAbdeckungs-Check (Seiten mit 1000er-Limit):")
+    any_capped = False
+    for page, ids in page_sets.items():
+        if len(ids) < 1000:
+            continue
+        any_capped = True
+        others = set().union(*(v for k, v in page_sets.items() if k != page))
+        print(f"  {page}: {len(ids - others)} Items nur hier (nicht auf anderen Seiten)")
+    if not any_capped:
+        print("  keine Seite am Limit - Abdeckung vollstaendig.")
+    else:
+        print("  Gedeckelte Seiten sind nur dann ok, wenn ihre Unterklassen (items=K.U) alle unter 1000 liegen.")
 
     if not found:
         sys.exit("Keine Items gefunden - Abbruch (nichts gespeichert).")
@@ -176,6 +240,9 @@ def main():
             name, item_type = found[item_id]
             try:
                 tip_name, tip = fetch_tooltip(item_id, args.tooltip_url)
+            except Throttled as exc:
+                sys.exit(f"\n!! Wowhead bremst/blockiert ({exc}).\n"
+                         "   Zwischenstand ist gespeichert - spaeter erneut starten, es geht weiter.")
             except (RuntimeError, ValueError) as exc:
                 errors += 1
                 print(f"  !! Item {item_id}: {exc}")
