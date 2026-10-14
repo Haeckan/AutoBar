@@ -13,7 +13,7 @@ import logging
 import os.path
 import json
 
-AGENT_HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:72.0) Gecko/20100101 Firefox/72.0'}
+AGENT_HEADERS = {'User-Agent': 'AutoBarForeverUpdater/1.0 (personal addon data update)'}
 WOWHEAD_REQUEST_TIMEOUT_SECONDS = (60 * 5)
 
 # Maps this script's xpac slug to the WoWData repo's items_<slug>.pkl slug, for the

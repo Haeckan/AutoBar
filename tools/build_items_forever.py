@@ -49,6 +49,7 @@ LIST_PAGES = [
     "items/quest",
     "items/miscellaneous",
     "items/trade-goods",
+    "trinkets",   # noetig fuer Muffin.Gear.Trinket.Usable/Nonusable (Tooltip "Use:")
 ]
 
 # Lueckenlose Abdeckung: zusaetzlich JEDE Unterklasse per Nummer abfragen
@@ -69,11 +70,26 @@ ITEM_CLASS = {
     11: "Quiver", 12: "Quest", 13: "Key", 15: "Miscellaneous",
 }
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0"}
+# Ehrlich als Skript auftreten (kein vorgetaeuschter Browser); per --user-agent aenderbar
+HEADERS = {"User-Agent": "AutoBarForeverUpdater/1.0 (personal addon data update)"}
 TIMEOUT = 60
 
 
 # ---------------------------------------------------------------- Hilfsfunktionen
+GENERIC_PAGE = {0: "items/consumables", 7: "items/trade-goods", 12: "items/quest", 15: "items/miscellaneous"}
+
+
+def is_fallback(page, lv):
+    """Unbekannte Unterklasse: Wowhead zeigt dann die GANZE Klasse statt einer Unterklasse.
+    Erkennbar daran, dass die Items nicht alle die angefragte Unterklasse haben."""
+    try:
+        wanted = int(page.rsplit(".", 1)[-1])
+        subs = {int(i["subclass"]) for i in lv}
+    except (KeyError, TypeError, ValueError):
+        return False  # Feld 'subclass' fehlt -> keine Aussage moeglich
+    return bool(subs) and subs != {wanted}
+
+
 class Throttled(RuntimeError):
     """Wowhead bremst/blockiert (z.B. HTTP 202 = Bot-Schutzseite, 429, 403)."""
 
@@ -149,10 +165,22 @@ def main():
     ap.add_argument("--delay", type=float, default=0.6, help="Pause zwischen Anfragen in Sekunden (Standard 0.6)")
     ap.add_argument("--page-delay", type=float, default=2.0, help="Pause zwischen Listenseiten in Sekunden (Standard 2.0)")
     ap.add_argument("--no-cache", action="store_true", help="Listenseiten-Cache ignorieren")
+    ap.add_argument("--user-agent", help="eigener User-Agent-Text (Standard: ehrlicher Skript-Name)")
+    ap.add_argument("--probe-page", metavar="PFAD", help="nur eine Listenseite testen, z.B. items/consumables/flasks")
     ap.add_argument("--refresh", action="store_true", help="alle Tooltips neu laden, nicht nur neue Items")
     ap.add_argument("--probe", type=int, metavar="ITEM_ID", help="nur einen Tooltip testen und beenden")
     ap.add_argument("--tooltip-url", default=TOOLTIP_URL, help="URL-Muster fuer Tooltips, {id} als Platzhalter")
     args = ap.parse_args()
+
+    if args.user_agent:
+        HEADERS["User-Agent"] = args.user_agent
+
+    if args.probe_page:
+        r = requests.get(WOWHEAD_ROOT + args.probe_page, headers=HEADERS, timeout=TIMEOUT)
+        lv = parse_listview(r.text) if r.status_code == 200 else None
+        print(f"HTTP {r.status_code}, {len(r.content)} Bytes, User-Agent: {HEADERS['User-Agent']}")
+        print("Item-Liste:", "NICHT gefunden" if lv is None else f"{len(lv)} Items")
+        return
 
     if args.probe:
         name, text = fetch_tooltip(args.probe, args.tooltip_url)
@@ -169,12 +197,13 @@ def main():
     found = {}  # id -> (name, item_type)
     page_sets = {}  # Seite -> Menge der Item-IDs (fuer den Abdeckungs-Check)
     sweep_pages = [f"items={c}.{sc}" for c, subs in SUBCLASS_SWEEP.items() for sc in subs]
-    cache_path = Path("listpages_cache_forever.json")
+    cache_path = Path("listpages_cache_forever_v2.json")
     try:
         cache = json.loads(cache_path.read_text()) if cache_path.is_file() and not args.no_cache else {}
     except ValueError:
         cache = {}
     now = time.time()
+    skipped_sweep = 0
     for page in LIST_PAGES + sweep_pages:
         is_sweep = page in sweep_pages
         url = WOWHEAD_ROOT + page
@@ -193,13 +222,16 @@ def main():
                     print(f"  !! uebersprungen: {exc}")
                 continue
             if lv is not None:
-                lv = [{"id": int(i["id"]), "name": i.get("name", ""), "classs": i.get("classs")} for i in lv]
+                lv = [{"id": int(i["id"]), "name": i.get("name", ""), "classs": i.get("classs"), "subclass": i.get("subclass")} for i in lv]
             cache[page] = {"t": now, "items": lv}
             cache_path.write_text(json.dumps(cache))
             time.sleep(args.page_delay)
         if lv is None:
             if not is_sweep:  # leere Unterklassen im Sweep sind normal
                 print(f"  !! keine Item-Liste gefunden: {url} (Slug falsch oder Wowhead hat die Seite geaendert)")
+            continue
+        if is_sweep and is_fallback(page, lv):
+            skipped_sweep += 1
             continue
         capped = len(lv) >= 1000
         flag = "  <-- 1000er-Limit erreicht, Liste evtl. unvollstaendig!" if capped else ""
@@ -212,20 +244,20 @@ def main():
         print("\n  !! WARNUNG: KEINE einzige Unterklassen-Seite (items=K.U) lieferte Items.")
         print("     Vermutlich funktioniert dieses URL-Format bei Wowhead Forever nicht -> Sweep wirkungslos!")
 
-    # Abdeckungs-Check: Was steht NUR auf einer gedeckelten Seite und auf keiner anderen?
-    # (Dann wuerde es ohne die uebrigen Seiten fehlen - und evtl. fehlt noch mehr dahinter.)
-    print("\nAbdeckungs-Check (Seiten mit 1000er-Limit):")
-    any_capped = False
-    for page, ids in page_sets.items():
-        if len(ids) < 1000:
-            continue
-        any_capped = True
-        others = set().union(*(v for k, v in page_sets.items() if k != page))
-        print(f"  {page}: {len(ids - others)} Items nur hier (nicht auf anderen Seiten)")
-    if not any_capped:
-        print("  keine Seite am Limit - Abdeckung vollstaendig.")
-    else:
-        print("  Gedeckelte Seiten sind nur dann ok, wenn ihre Unterklassen (items=K.U) alle unter 1000 liegen.")
+    print(f"\nSweep: {skipped_sweep} nicht existierende Unterklassen uebersprungen")
+    print("Abdeckung je Klasse:")
+    for c, generic in GENERIC_PAGE.items():
+        subs = {pg: ids for pg, ids in page_sets.items() if pg.startswith(f"items={c}.")}
+        if subs:
+            capped = [pg for pg, ids in subs.items() if len(ids) >= 1000]
+            total = len(set().union(*subs.values()))
+            if capped:
+                print(f"  Klasse {c}: UNVOLLSTAENDIG - {', '.join(capped)} am 1000er-Limit ({total} Items bekannt)")
+            else:
+                print(f"  Klasse {c}: vollstaendig ({total} Items in {len(subs)} Unterklassen)")
+        elif generic in page_sets:
+            n = len(page_sets[generic])
+            print(f"  Klasse {c}: {'UNVOLLSTAENDIG - am 1000er-Limit' if n >= 1000 else 'vollstaendig'} ({n} Items, nur Gesamtseite)")
 
     if not found:
         sys.exit("Keine Items gefunden - Abbruch (nichts gespeichert).")
